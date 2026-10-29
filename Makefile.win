@@ -1,0 +1,434 @@
+# ============================================================================
+#  Makefile.win — сборка под Windows через MSVC.
+#
+#      nmake /f Makefile.win
+#
+#  Запускать из «x64 Native Tools Command Prompt for VS» — обычная командная
+#  строка не знает ни cl, ни путей к библиотекам.
+#
+#  ПОЧЕМУ ОТДЕЛЬНЫЙ ФАЙЛ, А НЕ ВЕТКА В ОБЩЕМ MAKEFILE.
+#
+#  nmake — не GNU make. Он не понимает ни $(shell ...), ни $(foreach ...),
+#  ни условных функций, на которых держится определение архитектур видеокарты
+#  в общем Makefile. Попытка ужиться в одном файле кончилась бы тем, что
+#  каждая правка ломала бы вторую сборку молча.
+#
+#  /utf-8 обязателен: исходники в UTF-8, и без него MSVC прочитает
+#  кириллические строки в кодировке системы и выдаст мусор в консоль.
+# ============================================================================
+
+# Список архитектур видеокарт берётся у самого nvcc -- его добывает
+# gen_gencode.bat и кладёт сюда. nmake не умеет $(shell ...), поэтому шаг
+# отдельный. Без файла тоже собираем переносимый набор плюс PTX. GENCODE
+# из командной строки имеет приоритет и не требует изменения исходников.
+!IFNDEF GENCODE
+!IF EXIST(gencode.inc)
+!INCLUDE gencode.inc
+!ELSE
+GENCODE = -gencode arch=compute_75,code=sm_75 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_120,code=sm_120 -gencode arch=compute_75,code=compute_75
+!ENDIF
+!ENDIF
+
+CXX      = cl
+# ДОБАВЛЕНО ПРИ ПОРТЕ НА WINDOWS. Трёх определений здесь не хватало, и это
+# расхождение с GNU Makefile было не видно: check_makefiles.py сверяет списки
+# ФАЙЛОВ, но не флаги.
+#
+#   PKH_NATIVE_BUILD -- обязателен: значения по умолчанию в исходниках нет,
+#     ui.cpp обращается к нему напрямую и сборка падала на C2065. Ноль здесь
+#     означает "переносимая сборка", и это правда: никаких ключей подстройки
+#     под процессор сборочной машины (-march=native и подобных) в этом файле
+#     нет, а программа показывает это свойство на экране.
+#
+#   SCAN_PF / PF_DEPTH -- глубина предвыборки. В исходниках по умолчанию 12,
+#     но GNU Makefile берёт 8, и маковая сборка сделана именно с восемью (см.
+#     файл-отметку .config-secp-portable-h512-p8). Без этих строк Windows
+#     собиралась бы с другой настройкой, и сравнивать её скорость с маковой
+#     было бы не с чем: разница выглядела бы как разница систем, хотя на деле
+#     это разная глубина предвыборки.
+#
+#   SECP_HALF=512 совпадает со значением по умолчанию, задан явно для той же
+#     сверяемости.
+CXXFLAGS = /I. /std:c++17 /O2 /EHsc /utf-8 /nologo /W3 /DUSE_SECP /D_CRT_SECURE_NO_WARNINGS \
+           /DPKH_NATIVE_BUILD=0 /DSECP_HALF=512 /DSCAN_PF=8 /DPF_DEPTH=8
+SECP     = secp256k1
+INCLUDES = /I$(SECP) /I$(SECP)\src
+
+OBJS = main.obj pult_control.obj util.obj config.obj state.obj search.obj targets.obj zone_search.obj zone_mode.obj hybrid_search.obj hybrid_mode.obj \
+       engine.obj platform.obj gpu_info.obj traverse.obj traverse_modes.obj \
+       notify.obj found_card.obj key_qr.obj qrcodegen.obj telegram_found.obj ui.obj selftest.obj kxe_sass_backend.obj scan_secp.obj
+
+all: pubkeyhunt.exe
+
+pubkeyhunt.exe: $(OBJS)
+	$(CXX) /nologo /Fe:$@ $(OBJS)
+	@echo Gotovo: pubkeyhunt.exe
+
+.cpp.obj:
+	$(CXX) $(CXXFLAGS) $(INCLUDES) /c $<
+
+$(OBJS): pause_control.h
+$(OBJS): search.h
+main.obj ui.obj: single_instance.h
+main.obj: search_lifecycle.h
+main.obj ui.obj pult_control.obj: pult_control.h
+main.obj ui.obj: shape_checkpoint_restore.h
+main.obj: shape_checkpoint_commit.h
+notify.obj: found_display.h
+engine.obj: engine.cpp precise_sleep.h traverse.h gpu_startup_check.h cuda_scalar_guard.h
+engine.obj notify.obj selftest.obj: search_range.h targets.h
+selftest.obj: tests/app/strict_range_test.h
+main.obj traverse.obj traverse_modes.obj selftest.obj: traverse.h
+traverse_modes.obj: balanced_shape_traversal.h whole_shape_traversal.h shaped_traversal.h
+main.obj engine.obj traverse_modes.obj: packed_traversal.h packed_scan.h
+main.obj: wave_gpu_prefetch.h wave_gpu_batch.h interval_progress.h
+selftest.obj: wave_gpu_batch.h
+traverse_modes.obj ui.obj selftest.obj: interval_digits.h
+selftest.obj: tests/app/range_audit.h
+
+# scan_secp.c собирается как C (/TC), А НЕ как C++.
+#
+# Здесь стояло /TP -- «внутренние заголовки libsecp256k1 компилятор C от MSVC
+# не тянет». Проверка показала обратное: как раз C++ их и не тянет.
+# secp256k1_memcmp_var в secp256k1/src/util.h пишет
+#
+#     const unsigned char *p1 = s1;      /* s1 имеет тип const void* */
+#
+# В C такое присваивание законно и делается неявно; в C++ оно запрещено и
+# требует явного приведения. Под /TP сборка падала на C2440 внутри самой
+# библиотеки, а править чужую библиотеку нельзя -- она обновляется извне.
+#
+# libsecp256k1 -- код на C, и upstream собирает его MSVC именно как C.
+# /std:c11 даёт нужные возможности C99/C11, /EHsc убран (это ключ C++).
+CFLAGS_C = /std:c11 /O2 /utf-8 /nologo /W3 /DUSE_SECP /D_CRT_SECURE_NO_WARNINGS \
+           /DPKH_NATIVE_BUILD=0 /DSECP_HALF=512 /DSCAN_PF=8 /DPF_DEPTH=8
+
+scan_secp.obj: scan_secp.c scan_secp.h bloom.h
+	$(CXX) $(CFLAGS_C) $(INCLUDES) /TC /c scan_secp.c
+
+# --------------------------------------------------------------------------
+#  ПРОВЕРКИ. Запускать в этом порядке.
+#
+#  plat-test первым и не для порядка: Windows-часть platform.cpp писалась без
+#  возможности её собрать. Пока она не проверена, всё остальное стоит на
+#  песке — там сохранение позиции, папка находок и права на файлы с ключами.
+# --------------------------------------------------------------------------
+plat-test:
+	$(CXX) $(CXXFLAGS) /Fe:plat_selftest.exe platform.cpp tests/unit/plat_selftest.cpp
+	plat_selftest.exe
+
+field-test:
+	@if not exist build\tests mkdir build\tests
+	@if not exist obj_host_tests mkdir obj_host_tests
+	$(CXX) $(CXXFLAGS) /Foobj_host_tests\ /Fe:build\tests\pkfieldtest.exe tests/unit/cuda_field_test.cpp platform.cpp
+	build\tests\pkfieldtest.exe
+
+host-test:
+	@if not exist build\tests mkdir build\tests
+	@if not exist obj_host_tests mkdir obj_host_tests
+	$(CXX) $(CXXFLAGS) /Foobj_host_tests\ /Fe:build\tests\pkhosttest.exe tests/unit/cuda_host_test.cpp cuda_host.cpp platform.cpp
+	build\tests\pkhosttest.exe
+
+gpu-test:
+	$(CXX) $(CXXFLAGS) /Fe:pkgputest.exe gpu_info.cpp tests/unit/gpu_selftest.cpp platform.cpp
+	pkgputest.exe
+
+gpu-info: single_instance.h
+	$(CXX) $(CXXFLAGS) /DGPU_ADVICE_STANDALONE /Fe:pkgpu.exe \
+	    gpu_info.cpp gpu_main.cpp platform.cpp
+	pkgpu.exe
+
+# ---------------------------------------------------------------------------
+#  СБОРКА С ВИДЕОКАРТОЙ
+#
+#      gen_gencode.bat                 (один раз, спрашивает архитектуры у nvcc)
+#      nmake /f Makefile.win cuda
+#
+#  Даёт pubkeyhunt_cuda.exe. Отличия от обычной сборки ровно два:
+#  определён PKH_HAVE_CUDA (включает опрос карты в gpu_info.cpp и путь через
+#  карту в engine.cpp) и добавлены два файла GPU-модуля.
+#
+#  Объектные файлы НЕ общие с процессорной сборкой: там PKH_HAVE_CUDA не
+#  определён, и смешивать их значило бы получить программу, половина которой
+#  не знает о карте. Поэтому здесь всё компилируется одной командой в свои
+#  объектники, а не переиспользует *.obj.
+# БИБЛИОТЕКА ВРЕМЕНИ ВЫПОЛНЕНИЯ -- ОДНА НА ВСЕ ЧАСТИ СБОРКИ.
+#
+# Здесь этого не было, и линковка падала так: nvcc собирал ядра с /MD
+# (динамическая), а cl без явного ключа берёт /MT (статическая), потому что
+# именно это -- умолчание командной строки cl, в отличие от проектов Visual
+# Studio, где по умолчанию /MD. Линковщик выдавал LNK2038 про несовпадение
+# RuntimeLibrary и следом два десятка "неразрешённых внешних" вроде
+# __imp_fminf -- все они лишь следствие, а не отдельные поломки.
+#
+# Взято /MD, а не /MT: так собирает свои примеры и сама NVIDIA, и так уже
+# собран cuda_scan_gpu.obj -- значит не придётся заново гонять ядра через все
+# двенадцать архитектур. Цена: программе нужен установленный
+# распространяемый пакет Visual C++ (на машине со сборкой он есть всегда).
+# Понадобится exe, ни от чего не зависящий, -- поменять здесь на /MT и
+# пересобрать ядра.
+# РАЗМЕР ПАКЕТА НА НИТИ. Одно место на оба компилятора -- и это не удобство.
+#
+# CUDA_HALF задаёт, сколько ключей нить обсчитывает на одно обращение в поле.
+# Его читают И cuda_scan.cu (собирает nvcc), И cuda_host.cpp (собирает cl).
+# Разойдись эти два значения -- хост готовил бы таблицу одного размера, а
+# ядро читало бы другого: не падение, а тихо неверные ключи. Поэтому
+# определение здесь одно и подставляется в обе строки сборки.
+#
+# Что менять и зачем. Обращение в поле стоит около 271 умножения и делится на
+# CUDA_SPAN = 2*CUDA_HALF ключей: при 32 это 4.2 умножения на ключ только на
+# амортизацию, при 128 -- 1.06, при 256 -- 0.53. Само сложение в пакете стоит
+# около 3 умножений, так что при 32 больше половины работы уходит впустую.
+#
+# Обратная сторона: на нить приходится память. БЫЛО 4*CUDA_HALF*32 байт --
+# рабочие dx и iv ПЛЮС два массива абсцисс, которые ядро заполняло целиком, а
+# потом целиком перечитывало ради одной проверки на значение. Эти два массива
+# убраны (см. cpt_batch_visit): абсцисса проверяется там же, где посчитана.
+# Осталось 2*CUDA_HALF*32 байт на нить, то есть 32 байта на ключ.
+#
+# Ровно это и позволило поднять пакет с 32 до 128: при 32 амортизация
+# обращения стоила 8.5 умножения на ключ при 7 на всё остальное -- больше
+# половины работы уходило впустую; при 128 остаётся 2.1.
+#
+# Где именно выгода перевешивает -- вопрос ЗАМЕРА на конкретной карте, а не
+# рассуждения. Меняйте число, пересобирайте, смотрите на строку "Первый заход
+# карты" и на "из них:" под ней. Разумный разброс для проб: 64, 128, 256.
+# ЗАМЕР НА ЭТОЙ КАРТЕ (autoopt.ps1, по 140 секунд на вариант, мощность 100 %):
+#     HALF   регистры    keys/s          карта
+#      128   без огр.   3 650 722 202   4 217 422 378
+#      256   без огр.   4 277 071 599   5 036 835 605
+#      512   без огр.   4 760 255 420   5 356 895 856
+#      512   128        5 082 377 967   5 759 417 020   <-- взято
+#      512   160        4 581 298 449   5 131 882 083
+#      512   192        4 688 672 631   5 261 639 279
+#
+# От 128 без ограничения регистров до 512 с потолком 128 -- плюс 39 %.
+# Ни одной строки кода при этом не изменилось: только эти два числа.
+#
+# ВТОРОЙ ЗАХОД (autoopt2.ps1), уже с совмещением подготовки со счётом:
+#     512, конвейер выключен   5 153 960 755   +41.2 % от начала
+#     512, 4 куска             5 325 961 833   +45.9 %
+#     512, 8 кусков            5 350 813 423   +46.6 %   <-- по умолчанию
+#     1024, 8 кусков           4 670 776 934   хуже: 512 и есть оптимум
+#
+# ТРЕТИЙ ЗАХОД -- приведение по модулю на ассемблере (autoopt3.ps1):
+#     5 779 133 083   +8.0 % к предыдущему
+#
+# ЧЕТВЁРТЫЙ -- отдельное возведение в квадрат (autoopt4.ps1):
+#     квадрат как a*a, mr=128    5 762 414 455   (контроль, воспроизвёл третий)
+#     отдельный квадрат, mr=128  6 175 417 653   +7.2 %   <-- по умолчанию
+#     отдельный квадрат, mr=0    5 529 770 394
+#     отдельный квадрат, mr=160  5 440 291 908
+#
+# Потолок 128 остаётся победителем и после двух правок арифметики, хотя
+# давление на регистры менялось каждый раз. Проверять его заново всё равно
+# приходилось: предсказать это было нечем.
+#
+# ИТОГО 3 650 722 202 -> 6 175 417 653, в 1.69 раза.
+# Проверка "карта против процессора" (nmake /f Makefile.win cuda-test) проходит
+# на каждом шаге: 11 из 11, ни одного отказа.
+#
+# Обратите внимание на немонотонность по регистрам: 128 лучше, чем 160 и 192,
+# а те хуже, чем вовсе без ограничения. Занятость покупается регистрами, а за
+# регистры платят сбросами в локальную память, и середина оказывается худшим
+# из обоих. Подбирать это рассуждением бесполезно -- только замером.
+CUDA_HALF_N = 512
+
+# ДОБАВКА К СТРОКЕ nvcc, пустая по умолчанию. Нужна, чтобы мерить варианты
+# сборки, не правя этот файл под каждый замер:
+#
+#   nmake /f Makefile.win cuda NVCC_EXTRA="-Xptxas=-v"
+#       напечатать регистры на нить и сброс в локальную память -- два числа,
+#       по которым видно, упирается ядро в занятость или нет;
+#   nmake /f Makefile.win cuda NVCC_EXTRA="-maxrregcount=128"
+#       заставить компилятор уложиться в столько регистров: на карту влезет
+#       больше блоков, но лишнее уедет в локальную память. Что перевесит --
+#       вопрос замера, а не рассуждения;
+#   nmake /f Makefile.win cuda GENCODE="-gencode arch=compute_120,code=sm_120"
+#       собрать под одну свою карту вместо тринадцати архитектур. Ядро
+#       компилируется в тринадцать раз быстрее -- при подборе это заметно.
+#
+# nmake отдаёт приоритет макросам из командной строки, поэтому CUDA_HALF_N и
+# GENCODE тоже переопределяются оттуда, ничего здесь не меняя.
+# -maxrregcount=128 стоит здесь по результату замера (см. таблицу выше): он
+# даёт +7 % поверх размера пачки. Убрать -- вернётся 4760 вместо 5082.
+NVCC_EXTRA = -maxrregcount=128
+
+CRT_CUDA = /MD
+
+CUDA_INC = /I"$(CUDA_PATH)\include"
+# CUDA 13.3 cuda.lib import thunks carry LIBCMT defaults; all application and
+# CUDA runtime objects here use /MD. Keep one CRT instead of pulling both.
+CUDA_LIB = /LIBPATH:"$(CUDA_PATH)\lib\x64" cudart.lib cuda.lib /NODEFAULTLIB:LIBCMT
+
+SRC_CPP = main.cpp pult_control.cpp util.cpp config.cpp state.cpp search.cpp targets.cpp zone_search.cpp zone_mode.cpp hybrid_search.cpp hybrid_mode.cpp \
+          engine.cpp platform.cpp gpu_info.cpp traverse.cpp traverse_modes.cpp \
+          notify.cpp found_card.cpp key_qr.cpp qrcodegen.cpp telegram_found.cpp ui.cpp tests/app/selftest.cpp cuda_host.cpp kxe_sass_backend.cpp
+
+# ОБЪЕКТНИКИ СБОРКИ С КАРТОЙ ЛЕЖАТ ОТДЕЛЬНО. ЭТО НЕ АККУРАТНОСТЬ.
+#
+# Здесь компилировались ТЕ ЖЕ имена .obj, что и у обычной сборки, но другими
+# флагами: /MD против /MT по умолчанию и /DPKH_HAVE_CUDA против ничего. nmake
+# сверяет только время файла, поэтому после сборки с картой обычная брала
+# готовые чужие объектники и падала на линковке двумя разными способами сразу:
+#
+#   state.obj : error LNK2038: "RuntimeLibrary": "MD_DynamicRelease" не
+#               соответствует значению "MT_StaticRelease" в main.obj
+#   targets.obj : error LNK2019: неразрешённый внешний символ
+#               cuda_scan_set_targets
+#
+# Второе особенно неприятно: обычная сборка тянула ссылки на CUDA, которых у
+# неё быть не может. Лечилось это только `clean` вслепую -- то есть человек
+# должен был догадаться сам.
+#
+# В GNU-мейкфайле эта же беда описана в шапке как исправленная (пункт 3: "объектные
+# файлы разных конфигураций писались в один scan_secp.o"), и там заведены
+# отдельные каталоги build/. Здесь исправление не доехало. Теперь доехало.
+CUDA_EXE = pubkeyhunt_cuda.exe
+cuda: cuda_scan_gpu.obj scan_secp_cuda.obj single_instance.h
+	@if not exist obj_cuda mkdir obj_cuda
+	$(CXX) $(CXXFLAGS) $(CRT_CUDA) /DPKH_HAVE_CUDA /DCUDA_HALF=$(CUDA_HALF_N) $(INCLUDES) $(CUDA_INC) \
+	    /Foobj_cuda\ /Fe:$(CUDA_EXE) $(SRC_CPP) cuda_scan_gpu.obj scan_secp_cuda.obj \
+	    /link $(CUDA_LIB)
+	@echo Gotovo: $(CUDA_EXE)
+
+# Experimental SASS is disabled until independent device validation is available.
+sass-native-test-build:
+	@echo Experimental SASS is disabled. Use the standard CUDA build.
+	@exit /b 2
+
+wave-prefetch-test: cuda_scan_gpu.obj scan_secp_cuda.obj
+	@if not exist obj_wave_test mkdir obj_wave_test
+	@if not exist build\tests mkdir build\tests
+	$(CXX) $(CXXFLAGS) $(CRT_CUDA) /DPKH_HAVE_CUDA /DCUDA_HALF=$(CUDA_HALF_N) $(INCLUDES) $(CUDA_INC) \
+	    /Foobj_wave_test\ /Fe:build\tests\wave_prefetch_test.exe $(SRC_CPP:main.cpp=tests/unit/wave_prefetch_test.cpp) cuda_scan_gpu.obj scan_secp_cuda.obj \
+	    /link $(CUDA_LIB)
+	build\tests\wave_prefetch_test.exe
+
+# Ядра. Архитектуры -- из GENCODE, то есть от самого nvcc.
+cuda_scan_gpu.obj: cuda_scan.cu cuda_scan.h cuda_scalar_guard.h cuda_batch.cuh cuda_field.cuh vanity_vendor/GPUMath_corrected.h vanity_vendor/undef_macros.h bloom.h cuda_candidate_count.h packed_probe.h packed_probe_impl.cuh packed_scan.h packed_scan_impl.cuh packed_bit_ec.cuh packed_bit_fe.cuh
+	nvcc -std=c++17 -O3 $(GENCODE) -Xcompiler "/utf-8 /O2 $(CRT_CUDA)" $(NVCC_EXTRA) \
+	    -DPKH_HAVE_CUDA -DCUDA_HALF=$(CUDA_HALF_N) -c cuda_scan.cu -o cuda_scan_gpu.obj
+
+# Тот же scan_secp.c, но со своим именем объектника: у сборки с картой
+# отдельный набор, см. пояснение выше.
+scan_secp_cuda.obj: scan_secp.c scan_secp.h bloom.h
+	$(CXX) $(CFLAGS_C) $(CRT_CUDA) /DPKH_HAVE_CUDA $(INCLUDES) /TC /c scan_secp.c /Fo:scan_secp_cuda.obj
+
+# КАРТА ПРОТИВ ПРОЦЕССОРА, КЛЮЧ В КЛЮЧ. ЭТО ЗАПУСКАТЬ ПЕРВЫМ НА КАРТЕ.
+#
+# Цели не было вовсе: решающая проверка существовала только в GNU-мейкфайле,
+# то есть на Windows -- там, где программа и будет считать, -- прогнать её
+# было нечем. Пока она не сойдётся, счёту на карте верить нельзя: ошибка в
+# ядре не роняет программу, а даёт ноль совпадений при полной скорости, и
+# отличить это от обычного "ещё не нашли" невозможно.
+cuda-test: cuda_scan_gpu.obj
+	@if not exist obj_cuda_test mkdir obj_cuda_test
+	nvcc -std=c++17 -O3 $(GENCODE) $(NVCC_EXTRA) -Xcompiler "/utf-8 /O2 /EHsc $(CRT_CUDA)" \
+	    -DPKH_HAVE_CUDA -DCUDA_HALF=$(CUDA_HALF_N) -I. \
+	    -c tests/unit/cuda_selftest.cu -o obj_cuda_test\cuda_selftest.obj
+	$(CXX) $(CXXFLAGS) $(CRT_CUDA) /DCUDA_HALF=$(CUDA_HALF_N) /Foobj_cuda_test\ \
+	    /Fe:pkcudatest.exe cuda_host.cpp platform.cpp \
+	    obj_cuda_test\cuda_selftest.obj cuda_scan_gpu.obj /link $(CUDA_LIB)
+	pkcudatest.exe
+
+# Standalone host checks use their own objects, never the application CRT.
+filter-test:
+	@if not exist build\tests mkdir build\tests
+	@if not exist obj_host_tests mkdir obj_host_tests
+	$(CXX) $(CXXFLAGS) /DPKH_BLOOM_MUL32=0 /Foobj_host_tests\ /Fe:build\tests\filter_parity_test.exe tests/unit/filter_parity_test.cpp
+	build\tests\filter_parity_test.exe
+	$(CXX) $(CXXFLAGS) /DPKH_BLOOM_MUL32=1 /Foobj_host_tests\ /Fe:build\tests\filter_parity_test_mul32.exe tests/unit/filter_parity_test.cpp
+	build\tests\filter_parity_test_mul32.exe
+
+gpu-plan-test:
+	@if not exist build\tests mkdir build\tests
+	@if not exist obj_host_tests mkdir obj_host_tests
+	$(CXX) $(CXXFLAGS) /DCUDA_HALF=$(CUDA_HALF_N) /Foobj_host_tests\ /Fe:build\tests\gpu_plan_test.exe tests/unit/gpu_plan_test.cpp gpu_info.cpp platform.cpp
+	build\tests\gpu_plan_test.exe
+
+targets-test:
+	@if not exist build\tests mkdir build\tests
+	@if not exist obj_host_tests mkdir obj_host_tests
+	$(CXX) $(CFLAGS_C) $(INCLUDES) /TC /c scan_secp.c /Foobj_host_tests\scan_secp.obj
+	$(CXX) $(CXXFLAGS) /Foobj_host_tests\ /Fe:build\tests\scan_targets_test.exe tests/unit/scan_targets_test.cpp obj_host_tests\scan_secp.obj
+	build\tests\scan_targets_test.exe
+
+cpu-tests: filter-test field-test host-test gpu-plan-test targets-test hybrid-test prefetch-test rotation-test
+
+rotation-test:
+	@if not exist build\tests mkdir build\tests
+	$(CXX) $(CXXFLAGS) /Febuild\tests\rotation_test.exe /Fobuild\tests\rotation_test.obj tests/unit/digit_rotation_test.cpp
+	build\tests\rotation_test.exe
+
+# ВСЁ ОДНОЙ КОМАНДОЙ, В ПРАВИЛЬНОМ ПОРЯДКЕ.
+#
+# Начинается с clean нарочно, а не для чистоты: объектники предыдущей сборки
+# могли остаться от другой конфигурации, и тогда линковка падает на
+# несоответствии библиотеки времени выполнения. Пока каталоги объектников не
+# были разведены (см. цель cuda), это был единственный способ собраться.
+#
+# nmake останавливается на первой же ошибке, поэтому до конца доходит только
+# то, что действительно прошло все проверки.
+full:
+	$(MAKE) /NOLOGO /f Makefile.win clean
+	$(MAKE) /NOLOGO /f Makefile.win plat-test
+	$(MAKE) /NOLOGO /f Makefile.win gpu-test
+	$(MAKE) /NOLOGO /f Makefile.win field-test
+	$(MAKE) /NOLOGO /f Makefile.win host-test
+	$(MAKE) /NOLOGO /f Makefile.win
+	pubkeyhunt.exe --test
+	$(MAKE) /NOLOGO /f Makefile.win cuda
+	$(MAKE) /NOLOGO /f Makefile.win cuda-test
+	@echo.
+	@echo === Vse proverki proydeny. Programma: pubkeyhunt_cuda.exe ===
+
+cuda-clean:
+	-del cuda_scan_gpu.obj scan_secp_cuda.obj pubkeyhunt_cuda.exe pkcudatest.exe gencode.inc 2>NUL
+	-rmdir /s /q obj_cuda 2>NUL
+
+test: pubkeyhunt.exe
+	pubkeyhunt.exe --test
+
+clean:
+	-del *.obj 2>NUL
+	-del pubkeyhunt.exe plat_selftest.exe pkgputest.exe pkgpu.exe 2>NUL
+	-del build\tests\pkfieldtest.exe build\tests\pkhosttest.exe pkcudatest.exe pubkeyhunt_cuda.exe 2>NUL
+	-rmdir /s /q obj_cuda 2>NUL
+
+notify.obj: notify.h found_card.h telegram_found.h found_persistence.h
+found_card.obj: found_card.h key_qr.h
+key_qr.obj: key_qr.h qrcodegen.hpp
+qrcodegen.obj: qrcodegen.hpp
+telegram_found.obj: telegram_found.h
+
+zone_search.obj zone_mode.obj: zone_search.h zone_walk.h
+hybrid_search.obj hybrid_mode.obj: hybrid_search.h hybrid_walk.h zone_walk.h
+main.obj ui.obj traverse.obj notify.obj hybrid_mode.obj: hybrid_mode.h
+main.obj ui.obj traverse.obj notify.obj zone_mode.obj: zone_mode.h
+
+# Standalone hybrid traversal and exact-checkpoint checks.
+hybrid-test:
+	@if not exist build\tests mkdir build\tests
+	@if not exist obj_host_tests mkdir obj_host_tests
+	$(CXX) /I. /nologo /std:c++17 /O2 /EHsc /utf-8 /W4 /D_CRT_SECURE_NO_WARNINGS \
+	    /Foobj_host_tests\ /Fe:build\tests\hybrid_test.exe tests/unit/hybrid_test.cpp hybrid_search.cpp platform.cpp
+	build\tests\hybrid_test.exe
+
+prefetch-test:
+	@if not exist build\tests mkdir build\tests
+	@if not exist obj_host_tests mkdir obj_host_tests
+	$(CXX) /I. /nologo /std:c++17 /O2 /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS \
+	    /Foobj_host_tests\ /Fe:build\tests\prefetch_test.exe tests/unit/prefetch_test.cpp zone_search.cpp hybrid_search.cpp platform.cpp
+	build\tests\prefetch_test.exe
+
+main.obj notify.obj engine.obj zone_mode.obj hybrid_mode.obj: minute_speed.h
+zone_mode.obj hybrid_mode.obj: batch_prefetch.h zone_search.h hybrid_search.h
+
+main.obj config.obj selftest.obj: worker_threads.h
+zone_search.obj hybrid_search.obj: checkpoint_integrity.h
+
+selftest.obj: tests/app/selftest.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) /c tests/app/selftest.cpp /Fo:selftest.obj
+
+main.obj config.obj: digit_rotation.h
