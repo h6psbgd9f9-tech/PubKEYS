@@ -35,8 +35,25 @@ function Import-MsvcEnvironment {
     $vcvars = Join-Path $installation 'VC\Auxiliary\Build\vcvars64.bat'
     if (-not (Test-Path -LiteralPath $vcvars -PathType Leaf)) { throw 'The x64 Visual Studio environment script was not found.' }
     if ($vcvars -match '["\r\n&|<>]') { throw 'Unsupported characters in the Visual Studio installation path.' }
-    $environmentLines = @(& $env:ComSpec /d /s /c ('"call "{0}" >nul && set"' -f $vcvars))
-    if ($LASTEXITCODE -ne 0) { throw 'Visual Studio could not initialize its x64 compilation environment.' }
+    # Pass cmd.exe its command line verbatim. PowerShell's native argument
+    # conversion can otherwise remove the quotes around an installation path
+    # containing spaces (for example, the Visual Studio GitHub runner path).
+    $environmentProcess = New-Object System.Diagnostics.Process
+    $environmentProcess.StartInfo.FileName = $env:ComSpec
+    $environmentProcess.StartInfo.Arguments = '/d /s /c (call "' + $vcvars + '" >nul) && set'
+    $environmentProcess.StartInfo.UseShellExecute = $false
+    $environmentProcess.StartInfo.CreateNoWindow = $true
+    $environmentProcess.StartInfo.RedirectStandardOutput = $true
+    $environmentProcess.StartInfo.RedirectStandardError = $true
+    try {
+        [void]$environmentProcess.Start()
+        $environmentError = $environmentProcess.StandardError.ReadToEndAsync()
+        $environmentOutput = $environmentProcess.StandardOutput.ReadToEnd()
+        $environmentProcess.WaitForExit()
+        if ($environmentProcess.ExitCode -ne 0) { throw 'Visual Studio could not initialize its x64 compilation environment.' }
+        [void]$environmentError.GetAwaiter().GetResult()
+        $environmentLines = @($environmentOutput -split '\r?\n')
+    } finally { $environmentProcess.Dispose() }
     foreach ($line in $environmentLines) {
         if ($line -match '^([^=]+)=(.*)$') {
             [Environment]::SetEnvironmentVariable($matches[1],$matches[2],'Process')
