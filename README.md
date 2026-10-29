@@ -19,6 +19,14 @@ results, checkpoints, Telegram credentials or Signal recipients are included.**
 The current application interface is primarily in Russian; this documentation
 and the public build interface are in English.
 
+## Windows control panel
+
+![PubKEYS Windows control panel during an active search](docs/images/control-panel.png)
+
+Unedited screenshot of the running application. The displayed private-key
+sample illustrates current candidate generation; it is not a confirmed match.
+The throughput shown belongs to that particular machine, mode and session.
+
 ## Quick start on Windows
 
 1. Install **Visual Studio 2022** or its **Build Tools**, selecting **Desktop
