@@ -1,0 +1,31 @@
+name: Windows source build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-and-panel:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compile the CPU engine and Windows panel
+        shell: pwsh
+        run: |
+          & .\build.cmd cpu
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify the build outputs without starting the application
+        shell: pwsh
+        run: |
+          foreach ($file in @('pubkeyhunt.exe', 'PubKEYS-Pult.exe')) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw ('Missing build output: ' + $file)
+            }
+          }
